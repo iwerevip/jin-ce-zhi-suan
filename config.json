@@ -122,7 +122,13 @@
     "dry_run": false,
     "on_duplicate": "ignore",
     "write_mode": "direct_db",
-    "direct_db_source": "duckdb"
+    "direct_db_source": "duckdb",
+    "duckdb_writer_enabled": true,
+    "resume_from_checkpoint": true,
+    "duckdb_writer_batch_rows": 3000,
+    "duckdb_writer_batch_codes": 8,
+    "duckdb_writer_wait_ms": 800,
+    "duckdb_writer_queue_maxsize": 256
   },
   "targets": [],
   "strategies": {

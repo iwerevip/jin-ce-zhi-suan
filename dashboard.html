@@ -6737,14 +6737,20 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
                     { path: 'history_sync.scheduler_start_time', label: '定时开启时间', type: 'text', placeholder: '例如：09:30', desc: '格式：HH:MM（24小时制），定时同步每日从该时间开始触发' },
                     { path: 'history_sync.time_mode', label: '时间模式', type: 'select', options: [{ value: 'lookback', label: 'lookback（最近N天）' }, { value: 'custom', label: 'custom（自定义区间）' }] },
                     { path: 'history_sync.lookback_days', label: '默认回看天数', type: 'number', min: 1, max: 3650, step: 1, slider: true },
-                    { path: 'history_sync.concurrency', label: '同步任务并发数', type: 'number', min: 1, max: 16, step: 1, slider: true, desc: '按股票任务维度并发，覆盖拉取源数据、缺失判定和写入；不是仅写入并发。DuckDB 直连写入时会自动回退为 1，避免文件锁冲突' },
+                    { path: 'history_sync.concurrency', label: '同步任务并发数', type: 'number', min: 1, max: 16, step: 1, slider: true, desc: '按股票任务维度并发，覆盖拉取源数据、缺失判定和串行写入提交；DuckDB 真实落盘由单写线程统一刷盘' },
                     { path: 'history_sync.custom_start_time', label: '自定义开始时间', type: 'text', placeholder: '例如：2026-03-01 09:30:00', desc: '格式：YYYY-MM-DD HH:MM:SS；time_mode=custom时生效' },
                     { path: 'history_sync.custom_end_time', label: '自定义结束时间', type: 'text', placeholder: '例如：2026-03-31 15:00:00', desc: '格式：YYYY-MM-DD HH:MM:SS；time_mode=custom时生效' },
                     { path: 'history_sync.session_only', label: '仅交易时段(09:30-15:00)', type: 'boolean' },
                     { path: 'history_sync.intraday_mode', label: '盘中窗口模式', type: 'boolean' },
                     { path: 'history_sync.max_codes', label: '默认祖宗上限', type: 'number', min: 1, max: 50000, step: 1, slider: true },
                     { path: 'history_sync.batch_size', label: '默认分批条数', type: 'number', min: 1, max: 5000, step: 1, slider: true },
-                    { path: 'history_sync.dry_run', label: '默认仅预演（不写库）', type: 'boolean', desc: '开启=只统计缺失与预计写入，不执行落库；关闭=真实写入数据库' }
+                    { path: 'history_sync.dry_run', label: '默认仅预演（不写库）', type: 'boolean', desc: '开启=只统计缺失与预计写入，不执行落库；关闭=真实写入数据库' },
+                    { path: 'history_sync.duckdb_writer_enabled', label: '启用DuckDB单写线程', type: 'boolean', desc: '仅 direct_db + duckdb 生效；开启后由单独写线程小批量串行刷盘' },
+                    { path: 'history_sync.resume_from_checkpoint', label: '从检查点恢复', type: 'boolean', desc: '仅 direct_db + duckdb 生效；失败后跳过已完成股票继续同步' },
+                    { path: 'history_sync.duckdb_writer_batch_rows', label: 'DuckDB批量行数', type: 'number', min: 1, max: 50000, step: 1, slider: true },
+                    { path: 'history_sync.duckdb_writer_batch_codes', label: 'DuckDB批量股票数', type: 'number', min: 1, max: 128, step: 1, slider: true },
+                    { path: 'history_sync.duckdb_writer_wait_ms', label: 'DuckDB等待毫秒', type: 'number', min: 1, max: 10000, step: 1, slider: true },
+                    { path: 'history_sync.duckdb_writer_queue_maxsize', label: 'DuckDB队列上限', type: 'number', min: 1, max: 5000, step: 1, slider: true }
                 ]
             },
             {
@@ -7755,6 +7761,9 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
                     <div class="text-[10px] text-slate-400">同步范围由 history_sync 配置项控制；定时同步每日从 history_sync.scheduler_start_time 开始执行。</div>
                     <div id="history-sync-risk-hints" class="text-[10px] text-amber-200 bg-amber-950/30 border border-amber-800/40 rounded p-2 leading-5">
                         正在读取风险提示...
+                    </div>
+                    <div id="history-sync-runtime-metrics" class="text-[10px] text-cyan-100 bg-cyan-950/20 border border-cyan-900/50 rounded p-2 leading-5">
+                        运行指标：暂无数据
                     </div>
                 `;
                 body.appendChild(ops);
@@ -14191,6 +14200,7 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
                 historySyncRunning = Boolean(data?.service?.is_running);
                 historySyncStopRequested = Boolean(data?.service?.stop_requested);
                 historySyncSchedulerRunning = Boolean(data?.scheduler_running);
+                renderHistorySyncRuntimeMetrics(data?.service?.active_report || data?.service?.last_report || {});
                 renderHistorySyncButtons();
             } catch (_) {}
         }
@@ -14220,10 +14230,14 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
             const directDbSource = String(getByPath(settings, 'history_sync.direct_db_source', 'mysql') || 'mysql').trim().toLowerCase();
             const rawConcurrency = Number(getByPath(settings, 'history_sync.concurrency', 1) || 1);
             const concurrency = Math.max(1, Math.floor(Number.isFinite(rawConcurrency) ? rawConcurrency : 1));
-            const effectiveConcurrency = writeMode === 'direct_db' && directDbSource === 'duckdb' ? 1 : Math.min(concurrency, 16);
+            const effectiveConcurrency = Math.min(concurrency, 16);
+            const duckdbWriterEnabled = Boolean(getByPath(settings, 'history_sync.duckdb_writer_enabled', true));
             const items = [];
             // 第一条固定展示当前并发口径，明确这是“按股票任务”的并发，而不是单独写入并发。
-            items.push(`当前设置为按股票任务并发=${concurrency}，实际生效并发=${effectiveConcurrency}；该并发覆盖拉取、判重和写入，不是仅写入并发${effectiveConcurrency !== concurrency ? '（DuckDB 直连写入已自动降级）' : ''}`);
+            items.push(`当前设置为按股票任务并发=${concurrency}，实际生效并发=${effectiveConcurrency}；该并发覆盖拉取、缺失判定和写入提交流程，不是直接并发落盘`);
+            if (writeMode === 'direct_db' && directDbSource === 'duckdb' && duckdbWriterEnabled) {
+                items.push('DuckDB 直连模式已启用单写线程，小批量串行刷盘；并发主要体现在多股票抓取和判重阶段');
+            }
             if (concurrency >= 5) {
                 items.push('高并发会放大源端限流与超时风险，建议先从 2-4 开始逐步压测');
             }
@@ -14237,7 +14251,7 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
                 items.push(`当前写入目标为 ${directDbSource}，按股票任务并发升高后，会增加数据库连接、锁等待与本地 IO 压力`);
             }
             if (writeMode === 'direct_db' && directDbSource === 'duckdb') {
-                items.push('DuckDB 为单文件写入模型，前台虽然允许配置任务并发，但实际执行会自动降级为 1，不会按高并发同时写入');
+                items.push(`DuckDB 为单文件写入模型；当前会保留按股票任务并发，但真实落盘统一由单写线程串行刷盘${duckdbWriterEnabled ? '，可通过运行指标观察 flush 批次和队列峰值' : ''}`);
             }
             items.push('并发执行后明细完成顺序可能与股票列表顺序不同，但汇总统计结果不受影响');
             return { items, concurrency, effectiveConcurrency, providerSource, writeMode, directDbSource };
@@ -14259,6 +14273,28 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
             const risk = getHistorySyncRiskItems(cfg);
             // 风险提示直接渲染在增量同步操作区，用户切换参数时能实时看到变化。
             host.innerHTML = risk.items.map((text) => `<div><i class="fa-solid fa-triangle-exclamation mr-1 text-amber-300"></i>${escapeHistorySyncHintHtml(text)}</div>`).join('');
+        }
+
+        function renderHistorySyncRuntimeMetrics(report) {
+            const host = document.getElementById('history-sync-runtime-metrics');
+            if (!host) return;
+            const runtime = report && typeof report === 'object' ? report : {};
+            const flushBatches = Number(runtime.writer_flush_batches || 0);
+            const flushedCodes = Number(runtime.writer_flushed_codes || 0);
+            const skippedCodes = Number(runtime.checkpoint_skipped_codes || 0);
+            const queuePeak = Number(runtime.writer_queue_peak_size || 0);
+            const checkpointDone = Number(runtime.checkpoint_completed_codes || 0);
+            const signature = String(runtime.checkpoint_task_signature || '').trim();
+            if (!flushBatches && !flushedCodes && !skippedCodes && !queuePeak && !checkpointDone && !signature) {
+                host.innerHTML = '运行指标：暂无数据';
+                return;
+            }
+            // 运行指标固定展示 DuckDB 串行写线程核心状态，便于观察吞吐和恢复效果。
+            const lines = [
+                `运行指标：flush批次=${flushBatches} · flush股票任务=${flushedCodes} · checkpoint跳过股票=${skippedCodes} · checkpoint完成股票=${checkpointDone} · 队列峰值=${queuePeak}`,
+                `检查点签名：${escapeHistorySyncHintHtml(signature || '--')}`,
+            ];
+            host.innerHTML = lines.map((text) => `<div>${text}</div>`).join('');
         }
 
         async function runHistorySync() {

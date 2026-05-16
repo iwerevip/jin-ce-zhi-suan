@@ -3751,6 +3751,12 @@ class HistorySyncRunRequest(BaseModel):
     on_duplicate: str = "ignore"
     write_mode: Optional[str] = None
     direct_db_source: Optional[str] = None
+    duckdb_writer_enabled: Optional[bool] = None
+    resume_from_checkpoint: Optional[bool] = None
+    duckdb_writer_batch_rows: Optional[int] = None
+    duckdb_writer_batch_codes: Optional[int] = None
+    duckdb_writer_wait_ms: Optional[int] = None
+    duckdb_writer_queue_maxsize: Optional[int] = None
     async_run: bool = False
 
 class HistorySyncScheduleRequest(BaseModel):
@@ -3770,6 +3776,12 @@ class HistorySyncScheduleRequest(BaseModel):
     on_duplicate: str = "ignore"
     write_mode: Optional[str] = None
     direct_db_source: Optional[str] = None
+    duckdb_writer_enabled: Optional[bool] = None
+    resume_from_checkpoint: Optional[bool] = None
+    duckdb_writer_batch_rows: Optional[int] = None
+    duckdb_writer_batch_codes: Optional[int] = None
+    duckdb_writer_wait_ms: Optional[int] = None
+    duckdb_writer_queue_maxsize: Optional[int] = None
 
 class FrontendAssetCacheRequest(BaseModel):
     relative_path: str
@@ -10272,6 +10284,12 @@ def _history_sync_payload_from_request(req: HistorySyncRunRequest):
         "on_duplicate": str(req.on_duplicate or "ignore"),
         "write_mode": str(req.write_mode or cfg.get("history_sync.write_mode", "api") or "api"),
         "direct_db_source": str(req.direct_db_source or cfg.get("history_sync.direct_db_source", "mysql") or "mysql"),
+        "duckdb_writer_enabled": bool(req.duckdb_writer_enabled) if req.duckdb_writer_enabled is not None else bool(cfg.get("history_sync.duckdb_writer_enabled", True)),
+        "resume_from_checkpoint": bool(req.resume_from_checkpoint) if req.resume_from_checkpoint is not None else bool(cfg.get("history_sync.resume_from_checkpoint", True)),
+        "duckdb_writer_batch_rows": max(1, int(req.duckdb_writer_batch_rows or cfg.get("history_sync.duckdb_writer_batch_rows", 3000) or 3000)),
+        "duckdb_writer_batch_codes": max(1, int(req.duckdb_writer_batch_codes or cfg.get("history_sync.duckdb_writer_batch_codes", 8) or 8)),
+        "duckdb_writer_wait_ms": max(1, int(req.duckdb_writer_wait_ms or cfg.get("history_sync.duckdb_writer_wait_ms", 800) or 800)),
+        "duckdb_writer_queue_maxsize": max(1, int(req.duckdb_writer_queue_maxsize or cfg.get("history_sync.duckdb_writer_queue_maxsize", 256) or 256)),
         "trigger_mode": "manual",
     }
 
@@ -10458,6 +10476,12 @@ async def _history_sync_scheduler_loop():
             "on_duplicate": str(cfg.get("history_sync.on_duplicate", "ignore") or "ignore"),
             "write_mode": str(cfg.get("history_sync.write_mode", "api") or "api"),
             "direct_db_source": str(cfg.get("history_sync.direct_db_source", "mysql") or "mysql"),
+            "duckdb_writer_enabled": bool(cfg.get("history_sync.duckdb_writer_enabled", True)),
+            "resume_from_checkpoint": bool(cfg.get("history_sync.resume_from_checkpoint", True)),
+            "duckdb_writer_batch_rows": max(1, int(cfg.get("history_sync.duckdb_writer_batch_rows", 3000) or 3000)),
+            "duckdb_writer_batch_codes": max(1, int(cfg.get("history_sync.duckdb_writer_batch_codes", 8) or 8)),
+            "duckdb_writer_wait_ms": max(1, int(cfg.get("history_sync.duckdb_writer_wait_ms", 800) or 800)),
+            "duckdb_writer_queue_maxsize": max(1, int(cfg.get("history_sync.duckdb_writer_queue_maxsize", 256) or 256)),
             "trigger_mode": "scheduler",
             "sync_interval_minutes": interval,
         }
@@ -10635,6 +10659,30 @@ async def api_history_sync_scheduler_start(req: HistorySyncScheduleRequest):
     cfg.set("history_sync.on_duplicate", str(req.on_duplicate or "ignore"))
     cfg.set("history_sync.write_mode", str(req.write_mode or "api"))
     cfg.set("history_sync.direct_db_source", str(req.direct_db_source or "mysql"))
+    cfg.set(
+        "history_sync.duckdb_writer_enabled",
+        bool(req.duckdb_writer_enabled) if req.duckdb_writer_enabled is not None else bool(cfg.get("history_sync.duckdb_writer_enabled", True)),
+    )
+    cfg.set(
+        "history_sync.resume_from_checkpoint",
+        bool(req.resume_from_checkpoint) if req.resume_from_checkpoint is not None else bool(cfg.get("history_sync.resume_from_checkpoint", True)),
+    )
+    cfg.set(
+        "history_sync.duckdb_writer_batch_rows",
+        max(1, int(req.duckdb_writer_batch_rows or cfg.get("history_sync.duckdb_writer_batch_rows", 3000) or 3000)),
+    )
+    cfg.set(
+        "history_sync.duckdb_writer_batch_codes",
+        max(1, int(req.duckdb_writer_batch_codes or cfg.get("history_sync.duckdb_writer_batch_codes", 8) or 8)),
+    )
+    cfg.set(
+        "history_sync.duckdb_writer_wait_ms",
+        max(1, int(req.duckdb_writer_wait_ms or cfg.get("history_sync.duckdb_writer_wait_ms", 800) or 800)),
+    )
+    cfg.set(
+        "history_sync.duckdb_writer_queue_maxsize",
+        max(1, int(req.duckdb_writer_queue_maxsize or cfg.get("history_sync.duckdb_writer_queue_maxsize", 256) or 256)),
+    )
     cfg.save()
     # 每次开启都重置日内锚点，确保新设置的开始时间立即生效。
     history_sync_scheduler_anchor_date = ""

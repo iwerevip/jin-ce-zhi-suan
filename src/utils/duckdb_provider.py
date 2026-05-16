@@ -87,6 +87,16 @@ class DuckDbProvider:
         try:
             return duckdb.connect(database=resolved_path, read_only=bool(read_only))
         except Exception as e:
+            err_text = str(e or "")
+            # DuckDB 同进程下若已存在读写连接，再打开只读连接会报配置冲突；此时回退到读写连接复用同一文件。
+            if bool(read_only) and "different configuration than existing connections" in err_text.lower():
+                try:
+                    conn = duckdb.connect(database=resolved_path, read_only=False)
+                    self.last_error = ""
+                    return conn
+                except Exception as retry_error:
+                    self.last_error = f"DuckDB 连接失败: {retry_error}"
+                    return None
             self.last_error = f"DuckDB 连接失败: {e}"
             return None
 
@@ -153,7 +163,11 @@ class DuckDbProvider:
         for c in ["open", "high", "low", "close", "vol", "amount"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["dt", "open", "high", "low", "close"])
-        df = df.sort_values("dt").drop_duplicates(subset=["dt"]).reset_index(drop=True)
+        dedup_keys = ["dt"]
+        if "code" in df.columns:
+            dedup_keys = ["code", "dt"]
+        # 多股票批量写入时必须按 code+dt 去重，不能只按时间去重，否则同一时刻不同股票会被误丢弃。
+        df = df.sort_values(dedup_keys).drop_duplicates(subset=dedup_keys).reset_index(drop=True)
         return df[["code", "dt", "open", "high", "low", "close", "vol", "amount"]]
 
     def _normalize_for_upsert(self, df):
@@ -380,13 +394,15 @@ class DuckDbProvider:
         conn.executemany(delete_sql, delete_params)
         conn.executemany(insert_sql, rows)
 
-    def upsert_kline_data(self, df, interval="1min", batch_size=2000):
+    def upsert_kline_data_with_conn(self, conn, df, interval="1min", batch_size=2000):
+        # 复用同一连接批量写入，供历史同步串行写线程持续刷盘。
         table = self._resolve_table_name(str(interval or "1min"))
         if not table:
             self.last_error = f"未配置 {interval} 对应的 DuckDB 表名"
             return 0
         norm = self._normalize_for_upsert(df)
         if norm.empty:
+            self.last_error = ""
             return 0
         rows = [
             (
@@ -401,10 +417,6 @@ class DuckDbProvider:
             )
             for _, r in norm.iterrows()
         ]
-        conn = self._connect(read_only=False)
-        if conn is None:
-            return 0
-        written = 0
         insert_sql = (
             f"INSERT INTO {self._quoted_table(table)} (code, trade_time, open, high, low, close, vol, amount) "
             f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -416,6 +428,7 @@ class DuckDbProvider:
             f"open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close, "
             f"vol=EXCLUDED.vol, amount=EXCLUDED.amount"
         )
+        written = 0
         try:
             step = max(1, int(batch_size or 2000))
             for i in range(0, len(rows), step):
@@ -425,7 +438,6 @@ class DuckDbProvider:
                 except Exception as e:
                     err_text = str(e).lower()
                     if "conflict target" in err_text or ("unique" in err_text and "primary key" in err_text):
-                        # 增量同步在写入前已经按目标库 existing_keys 做过去重；无唯一键场景直接插入缺失行即可。
                         conn.executemany(insert_sql, chunk)
                     else:
                         raise
@@ -433,9 +445,17 @@ class DuckDbProvider:
         except Exception as e:
             self.last_error = f"DuckDB 写入缓存失败: {e}"
             return 0
+        self.last_error = ""
+        return written
+
+    def upsert_kline_data(self, df, interval="1min", batch_size=2000):
+        conn = self._connect(read_only=False)
+        if conn is None:
+            return 0
+        try:
+            return int(self.upsert_kline_data_with_conn(conn, df, interval=interval, batch_size=batch_size) or 0)
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
-        return written

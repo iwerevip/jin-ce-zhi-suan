@@ -1,10 +1,13 @@
 import os
 import json
+import hashlib
 import logging
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from queue import Empty, Queue
 from typing import Any, Optional
 
 import pandas as pd
@@ -49,6 +52,225 @@ HISTORY_SYNC_EXISTING_KEYS_BATCH_SIZE = 200
 HISTORY_SYNC_EXISTING_KEYS_BATCH_SIZE_DUCKDB = 20
 HISTORY_SYNC_PROGRESS_LOG_EVERY = 50
 HISTORY_SYNC_SLOW_CODE_WARN_SEC = 15.0
+
+
+class HistorySyncCheckpointStore:
+    # 按股票保存 DuckDB 增量同步的恢复进度，避免失败后整轮从头开始。
+    def __init__(self, base_dir: str):
+        self.base_dir = str(base_dir or os.path.join("reports", "history_sync"))
+        os.makedirs(self.base_dir, exist_ok=True)
+
+    def build_task_signature(self, payload: dict[str, Any]) -> str:
+        codes = [str(item or "").strip().upper() for item in payload.get("codes", [])]
+        normalized = {
+            "provider_source": str(payload.get("provider_source", "") or "").strip().lower(),
+            "write_mode": str(payload.get("write_mode", "") or "").strip().lower(),
+            "direct_db_source": str(payload.get("direct_db_source", "") or "").strip().lower(),
+            "start_time": str(payload.get("start_time", "") or "").strip(),
+            "end_time": str(payload.get("end_time", "") or "").strip(),
+            "tables": [str(item or "").strip().lower() for item in payload.get("tables", [])],
+            "codes_digest": hashlib.sha1(",".join(codes).encode("utf-8")).hexdigest(),
+            "session_only": bool(payload.get("session_only", True)),
+        }
+        text = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def _file_path(self, task_signature: str) -> str:
+        return os.path.join(self.base_dir, f"checkpoint_{task_signature}.json")
+
+    def initialize(self, payload: dict[str, Any], total_codes: int) -> dict[str, Any]:
+        signature = self.build_task_signature(payload)
+        current = self.load(signature)
+        if current:
+            return current
+        checkpoint = {
+            "task_signature": signature,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "status": "running",
+            "completed_codes": [],
+            "failed_code": "",
+            "error": "",
+            "summary": {
+                "codes_total": int(total_codes or 0),
+                "codes_completed": 0,
+            },
+        }
+        self.save(signature, checkpoint)
+        return checkpoint
+
+    def load(self, task_signature: str) -> dict[str, Any]:
+        file_path = self._file_path(task_signature)
+        if not os.path.exists(file_path):
+            return {}
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def save(self, task_signature: str, checkpoint: dict[str, Any]) -> None:
+        checkpoint["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(self._file_path(task_signature), "w", encoding="utf-8") as f:
+            json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+
+    def mark_code_completed(self, task_signature: str, code: str) -> dict[str, Any]:
+        checkpoint = self.load(task_signature)
+        completed_codes = checkpoint.get("completed_codes", [])
+        normalized_code = str(code or "").strip().upper()
+        if normalized_code and normalized_code not in completed_codes:
+            completed_codes.append(normalized_code)
+            checkpoint["completed_codes"] = completed_codes
+            checkpoint["summary"]["codes_completed"] = len(completed_codes)
+            checkpoint["status"] = "running"
+            self.save(task_signature, checkpoint)
+        return checkpoint
+
+
+@dataclass
+class DuckDbWriteTask:
+    # 表示某只股票某张表的一次 DuckDB 待写请求。
+    code: str
+    table: str
+    interval: str
+    df: pd.DataFrame
+    source_rows: int
+    existing_rows: int
+    missing_rows: int
+    result_future: Future = field(default_factory=Future)
+    queued_at: float = field(default_factory=time.perf_counter)
+
+
+class DuckDbSerialWriter:
+    # 通过单独写线程串行刷 DuckDB，规避单文件并发写入冲突。
+    def __init__(
+        self,
+        provider: DuckDbProvider,
+        batch_size: int,
+        max_batch_rows: int,
+        max_batch_codes: int,
+        max_wait_ms: int,
+        queue_maxsize: int,
+    ):
+        self.provider = provider
+        self.batch_size = max(1, int(batch_size or 1))
+        self.max_batch_rows = max(1, int(max_batch_rows or 1))
+        self.max_batch_codes = max(1, int(max_batch_codes or 1))
+        self.max_wait_ms = max(1, int(max_wait_ms or 1))
+        self.queue = Queue(maxsize=max(1, int(queue_maxsize or 1)))
+        self.fatal_error: Optional[Exception] = None
+        self.flush_batches = 0
+        self.flushed_codes = 0
+        self.queue_peak_size = 0
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._conn = None
+        self._buckets: dict[tuple[str, str], list[DuckDbWriteTask]] = {}
+
+    def start(self) -> None:
+        self._conn = self.provider._connect(read_only=False)
+        if self._conn is None:
+            raise RuntimeError(self.provider.last_error or "DuckDB 写连接初始化失败")
+        self._thread = threading.Thread(target=self._run, name="history-sync-duckdb-writer", daemon=True)
+        self._thread.start()
+
+    def submit(self, task: DuckDbWriteTask) -> None:
+        if self.fatal_error is not None:
+            raise RuntimeError(str(self.fatal_error))
+        self.queue.put(task, block=True)
+        # 记录队列峰值，便于观察生产端速度是否持续快于写线程刷盘速度。
+        self.queue_peak_size = max(self.queue_peak_size, int(self.queue.qsize() or 0))
+
+    def _bucket_key(self, task: DuckDbWriteTask) -> tuple[str, str]:
+        return (str(task.table or "").strip().lower(), str(task.interval or "").strip())
+
+    def _should_flush(self, tasks: list[DuckDbWriteTask]) -> bool:
+        if not tasks:
+            return False
+        total_rows = sum(int(item.missing_rows or 0) for item in tasks)
+        code_count = len({str(item.code or "").strip().upper() for item in tasks})
+        oldest_queued_at = min(item.queued_at for item in tasks)
+        wait_ms = (time.perf_counter() - oldest_queued_at) * 1000.0
+        return total_rows >= self.max_batch_rows or code_count >= self.max_batch_codes or wait_ms >= self.max_wait_ms
+
+    def _flush_bucket(self, key: tuple[str, str]) -> None:
+        tasks = self._buckets.get(key, [])
+        if not tasks:
+            return
+        _, interval = key
+        frames = [item.df for item in tasks if item.df is not None and not item.df.empty]
+        merged_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        written_rows = int(
+            self.provider.upsert_kline_data_with_conn(
+                self._conn,
+                merged_df,
+                interval=interval,
+                batch_size=self.batch_size,
+            )
+            or 0
+        )
+        if written_rows <= 0 and str(getattr(self.provider, "last_error", "")).strip():
+            raise RuntimeError(self.provider.last_error)
+        self.flush_batches += 1
+        self.flushed_codes += len(tasks)
+        for item in tasks:
+            if not item.result_future.done():
+                item.result_future.set_result(
+                    {
+                        "code": item.code,
+                        "table": item.table,
+                        "written_rows": int(item.missing_rows or 0),
+                    }
+                )
+        self._buckets[key] = []
+
+    def _flush_due_buckets(self) -> None:
+        for key, tasks in list(self._buckets.items()):
+            if self._should_flush(tasks):
+                self._flush_bucket(key)
+
+    def _flush_all(self) -> None:
+        for key in list(self._buckets.keys()):
+            if self._buckets.get(key):
+                self._flush_bucket(key)
+
+    def _fail_pending(self, error: Exception) -> None:
+        for tasks in self._buckets.values():
+            for item in tasks:
+                if not item.result_future.done():
+                    item.result_future.set_exception(error)
+        self._buckets = {}
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except Empty:
+                break
+            if not item.result_future.done():
+                item.result_future.set_exception(error)
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_event.is_set() or not self.queue.empty():
+                try:
+                    task = self.queue.get(timeout=0.05)
+                except Empty:
+                    self._flush_due_buckets()
+                    continue
+                key = self._bucket_key(task)
+                self._buckets.setdefault(key, []).append(task)
+                if self._should_flush(self._buckets[key]):
+                    self._flush_bucket(key)
+            self._flush_all()
+        except Exception as e:
+            self.fatal_error = e
+            self._fail_pending(e)
+
+    def close_and_wait(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
 
 def normalize_history_sync_tables(tables: Any) -> list[str]:
@@ -195,17 +417,31 @@ class HistoryDiffSyncService:
         self._is_running = False
         self._stop_requested = False
         self._last_report: dict[str, Any] = {}
+        self._current_report: dict[str, Any] = {}
         self._last_record: dict[str, Any] = {}
         self._records_dir = os.path.join("reports", "history_sync")
         self._worker_local = threading.local()
+        self._duckdb_writer: Optional[DuckDbSerialWriter] = None
+        self._duckdb_checkpoint_store: Optional[HistorySyncCheckpointStore] = None
 
     def _is_day_table(self, table: str) -> bool:
         return str(table or "").strip().lower() in {"dat_days", "dat_day"}
+
+    def _set_current_report(self, report: dict[str, Any], status: str = "running") -> None:
+        # 运行中快照独立保存，供状态接口实时返回，避免必须等整轮结束才看到统计结果。
+        snapshot = json.loads(json.dumps(report or {}, ensure_ascii=False))
+        snapshot["status"] = str(status or "running")
+        self._current_report = snapshot
+
+    def _clear_current_report(self) -> None:
+        # 任务结束后清空运行中快照，避免前端把旧快照误判为当前执行态。
+        self._current_report = {}
 
     def get_status(self) -> dict[str, Any]:
         return {
             "is_running": self._is_running,
             "stop_requested": self._stop_requested,
+            "active_report": self._current_report,
             "last_report": self._last_report,
             "last_record": self._last_record,
         }
@@ -221,6 +457,7 @@ class HistoryDiffSyncService:
             return {"status": "busy", "msg": "sync task is already running", "report": self._last_report}
         self._is_running = True
         self._stop_requested = False
+        self._clear_current_report()
         started_at = datetime.now()
         normalized_payload = json.loads(json.dumps(payload or {}, ensure_ascii=False))
         execution_meta = self._build_execution_meta(normalized_payload)
@@ -229,6 +466,7 @@ class HistoryDiffSyncService:
             report["started_at"] = started_at.isoformat(timespec="seconds")
             report["finished_at"] = datetime.now().isoformat(timespec="seconds")
             self._last_report = report
+            self._clear_current_report()
             result = {"status": "success", "report": report}
             record = self._persist_run_record(payload=self._build_record_payload(normalized_payload, report), result=result)
             result["record"] = record
@@ -247,6 +485,7 @@ class HistoryDiffSyncService:
                 "direct_db_source": execution_meta.get("direct_db_source", ""),
             }
             self._last_report = report
+            self._clear_current_report()
             result = {"status": "stopped" if stopped else "error", "msg": msg, "report": report}
             record = self._persist_run_record(payload=self._build_record_payload(normalized_payload, report), result=result)
             result["record"] = record
@@ -263,6 +502,7 @@ class HistoryDiffSyncService:
                 "direct_db_source": execution_meta.get("direct_db_source", ""),
             }
             self._last_report = report
+            self._clear_current_report()
             result = {"status": "error", "msg": str(e), "report": report}
             record = self._persist_run_record(payload=self._build_record_payload(normalized_payload, report), result=result)
             result["record"] = record
@@ -466,6 +706,39 @@ class HistoryDiffSyncService:
             provider=target_db_provider,
             sample_code=codes[0],
         )
+        use_serial_writer = self._is_duckdb_serial_writer_enabled(write_mode, direct_db_source, cfg)
+        task_signature = ""
+        checkpoint_skipped_codes = 0
+        self._duckdb_checkpoint_store = None
+        self._duckdb_writer = None
+        if use_serial_writer:
+            checkpoint_payload = {
+                "provider_source": provider_source,
+                "write_mode": write_mode,
+                "direct_db_source": direct_db_source,
+                "start_time": start_time.isoformat(timespec="seconds"),
+                "end_time": end_time.isoformat(timespec="seconds"),
+                "tables": tables,
+                "codes": codes,
+                "session_only": session_only,
+            }
+            self._duckdb_checkpoint_store = HistorySyncCheckpointStore(base_dir=self._records_dir)
+            if self._as_bool(_cfg_get(cfg, "history_sync.resume_from_checkpoint", True), True):
+                checkpoint = self._duckdb_checkpoint_store.initialize(checkpoint_payload, total_codes=len(codes))
+                task_signature = str(checkpoint.get("task_signature", "") or "")
+                completed_codes = {str(item or "").strip().upper() for item in checkpoint.get("completed_codes", [])}
+                checkpoint_skipped_codes = len(completed_codes)
+                if completed_codes:
+                    codes = [code for code in codes if str(code or "").strip().upper() not in completed_codes]
+            self._duckdb_writer = DuckDbSerialWriter(
+                provider=target_db_provider,
+                batch_size=batch_size,
+                max_batch_rows=int(_cfg_get(cfg, "history_sync.duckdb_writer_batch_rows", 3000) or 3000),
+                max_batch_codes=int(_cfg_get(cfg, "history_sync.duckdb_writer_batch_codes", 8) or 8),
+                max_wait_ms=int(_cfg_get(cfg, "history_sync.duckdb_writer_wait_ms", 800) or 800),
+                queue_maxsize=int(_cfg_get(cfg, "history_sync.duckdb_writer_queue_maxsize", 256) or 256),
+            )
+            self._duckdb_writer.start()
 
         summary = {
             "codes_total": len(codes),
@@ -484,12 +757,19 @@ class HistoryDiffSyncService:
             "total_existing_rows": 0,
             "total_missing_rows": 0,
             "total_written_rows": 0,
+            "checkpoint_task_signature": task_signature,
+            "checkpoint_completed_codes": 0,
+            "checkpoint_skipped_codes": int(checkpoint_skipped_codes or 0),
+            "writer_flush_batches": 0,
+            "writer_flushed_codes": 0,
+            "writer_queue_peak_size": 0,
             "code_reports": [],
         }
         logger.info(
             f"增量同步开始：拉取源={provider_source} 股票总数={len(codes)} 表={tables} "
             f"写入模式={write_mode} 并发={effective_concurrency} 预演={dry_run}"
         )
+        self._set_current_report(summary, status="running")
         existing_keys_chunk_size = self._resolve_existing_keys_chunk_size(target_db_provider)
         code_chunks = _chunk_list(codes, existing_keys_chunk_size)
         total_codes = len(codes)
@@ -577,6 +857,16 @@ class HistoryDiffSyncService:
                     self._append_code_report_to_summary(summary, code_report if isinstance(code_report, dict) else {})
                     code_elapsed = float(code_result.get("code_elapsed", 0.0) or 0.0)
                     summary["code_reports"].append(code_report)
+                    if use_serial_writer and task_signature and self._duckdb_checkpoint_store is not None:
+                        checkpoint = self._duckdb_checkpoint_store.mark_code_completed(task_signature, code)
+                        summary["checkpoint_completed_codes"] = int(
+                            ((checkpoint or {}).get("summary", {}) or {}).get("codes_completed", 0) or 0
+                        )
+                    if self._duckdb_writer is not None:
+                        summary["writer_flush_batches"] = int(getattr(self._duckdb_writer, "flush_batches", 0) or 0)
+                        summary["writer_flushed_codes"] = int(getattr(self._duckdb_writer, "flushed_codes", 0) or 0)
+                        summary["writer_queue_peak_size"] = int(getattr(self._duckdb_writer, "queue_peak_size", 0) or 0)
+                    self._set_current_report(summary, status="running")
                     # 每完成一只股票后输出一次完成进度，便于长任务时持续观察实际推进情况。
                     chunk_done = processed_codes - ((chunk_index - 1) * existing_keys_chunk_size)
                     percent = (processed_codes / total_codes * 100.0) if total_codes > 0 else 0.0
@@ -600,10 +890,20 @@ class HistoryDiffSyncService:
                 next_existing_future.cancel()
             if existing_keys_executor is not None:
                 existing_keys_executor.shutdown(wait=False, cancel_futures=True)
+            if self._duckdb_writer is not None:
+                self._duckdb_writer.close_and_wait()
+                summary["writer_flush_batches"] = int(getattr(self._duckdb_writer, "flush_batches", 0) or 0)
+                summary["writer_flushed_codes"] = int(getattr(self._duckdb_writer, "flushed_codes", 0) or 0)
+                summary["writer_queue_peak_size"] = int(getattr(self._duckdb_writer, "queue_peak_size", 0) or 0)
+                if self._duckdb_writer.fatal_error is not None:
+                    raise RuntimeError(f"duckdb serial writer failed: {self._duckdb_writer.fatal_error}")
+                self._duckdb_writer = None
         logger.info(
             f"增量同步完成：源数据总行数={summary['total_source_rows']} "
             f"已存在总行数={summary['total_existing_rows']} 缺失总行数={summary['total_missing_rows']} "
-            f"写入总行数={summary['total_written_rows']} 有效并发={summary['effective_concurrency']}"
+            f"写入总行数={summary['total_written_rows']} 有效并发={summary['effective_concurrency']} "
+            f"writer批次={summary['writer_flush_batches']} writer股票任务={summary['writer_flushed_codes']} "
+            f"writer队列峰值={summary['writer_queue_peak_size']} checkpoint跳过股票={summary['checkpoint_skipped_codes']}"
         )
         return summary
 
@@ -613,21 +913,45 @@ class HistoryDiffSyncService:
             return HISTORY_SYNC_EXISTING_KEYS_BATCH_SIZE_DUCKDB
         return HISTORY_SYNC_EXISTING_KEYS_BATCH_SIZE
 
+    def _is_duckdb_serial_writer_enabled(self, write_mode: str, direct_db_source: str, cfg: dict[str, Any]) -> bool:
+        # 仅 DuckDB 直写模式启用串行写线程，其他写入链路保持原样。
+        return (
+            str(write_mode or "").strip().lower() == "direct_db"
+            and str(direct_db_source or "").strip().lower() == "duckdb"
+            and self._as_bool(_cfg_get(cfg, "history_sync.duckdb_writer_enabled", True), True)
+        )
+
+    def _submit_duckdb_write_task(
+        self,
+        code: str,
+        table: str,
+        df: pd.DataFrame,
+        source_rows: int,
+        existing_rows: int,
+        missing_rows: int,
+    ) -> dict[str, Any]:
+        # 工作线程只负责提交缺失数据并等待写线程确认结果。
+        if self._duckdb_writer is None:
+            raise RuntimeError("duckdb serial writer not initialized")
+        task = DuckDbWriteTask(
+            code=code,
+            table=table,
+            interval=TABLE_INTERVAL_MAP.get(table, "1min"),
+            df=df,
+            source_rows=source_rows,
+            existing_rows=existing_rows,
+            missing_rows=missing_rows,
+        )
+        self._duckdb_writer.submit(task)
+        return task.result_future.result(timeout=300)
+
     def _resolve_effective_concurrency(self, requested_concurrency: Any, write_mode: str, direct_db_source: str) -> int:
         # 并发上限做保护，避免前台误填过大值直接把本机/数据库压垮。
         try:
             normalized = max(1, int(requested_concurrency or 1))
         except Exception:
             normalized = 1
-        normalized = min(normalized, 16)
-        # DuckDB 是单文件写入模型，增量同步直连写入时强制串行，避免锁冲突放大。
-        if write_mode == "direct_db" and direct_db_source == "duckdb" and normalized > 1:
-            logger.warning(
-                f"增量同步并发已自动降级：write_mode={write_mode} direct_db_source={direct_db_source} "
-                f"requested={normalized} effective=1"
-            )
-            return 1
-        return normalized
+        return min(normalized, 16)
 
     def _build_worker_runtime(
         self,
@@ -697,6 +1021,7 @@ class HistoryDiffSyncService:
         session = runtime.get("session")
         headers = runtime.get("headers", {})
         target_db_provider = runtime.get("target_db_provider")
+        serial_duckdb = self._is_duckdb_serial_writer_enabled(write_mode, direct_db_source, cfg)
         if write_mode == "direct_db":
             self._ensure_target_db_ready(
                 write_mode=write_mode,
@@ -750,10 +1075,21 @@ class HistoryDiffSyncService:
                     )
                 else:
                     upsert_df = self._build_direct_db_upsert_df(table=table, df=missing_df)
-                    interval = TABLE_INTERVAL_MAP.get(table, "1min")
-                    written_rows = int(target_db_provider.upsert_kline_data(upsert_df, interval=interval, batch_size=batch_size) or 0)
-                    if written_rows <= 0 and str(getattr(target_db_provider, "last_error", "")).strip():
-                        raise RuntimeError(f"direct_db upsert failed table={table} code={code}: {target_db_provider.last_error}")
+                    if serial_duckdb:
+                        write_result = self._submit_duckdb_write_task(
+                            code=code,
+                            table=table,
+                            df=upsert_df,
+                            source_rows=int(len(source_df)),
+                            existing_rows=int(len(existing_keys)),
+                            missing_rows=int(len(missing_df)),
+                        )
+                        written_rows = int(write_result.get("written_rows", 0) or 0)
+                    else:
+                        interval = TABLE_INTERVAL_MAP.get(table, "1min")
+                        written_rows = int(target_db_provider.upsert_kline_data(upsert_df, interval=interval, batch_size=batch_size) or 0)
+                        if written_rows <= 0 and str(getattr(target_db_provider, "last_error", "")).strip():
+                            raise RuntimeError(f"direct_db upsert failed table={table} code={code}: {target_db_provider.last_error}")
             code_report["tables"].append(
                 {
                     "table": table,
