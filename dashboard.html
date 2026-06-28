@@ -1868,23 +1868,26 @@
             </div>
 
             <!-- 免责声明条 -->
-            <div class="px-4 py-1.5 bg-slate-700/50 text-center text-xs text-slate-300 shrink-0">
-                本工具仅用于历史数据筛选与量化研究，不构成任何投资建议。不推荐股票、不预测走势、不提供买卖依据。投资有风险，决策需独立审慎判断。
+            <div class="px-4 py-1.5 bg-red-900/40 border-y border-red-500/50 text-center text-xs font-bold text-red-300 shrink-0">
+                <i class="fa-solid fa-triangle-exclamation mr-1 text-red-400"></i>本工具仅用于历史数据筛选与量化研究，不构成任何投资建议。不推荐股票、不预测走势、不提供买卖依据。投资有风险，决策需独立审慎判断。
             </div>
-            <!-- 数据来源说明卡：用于明确“数据来自哪里、落在哪、如何使用”。 -->
-            <div id="screener-data-source-panel" class="px-4 py-2 border-b border-slate-700 bg-slate-950/50 text-[11px] text-slate-300 shrink-0">
-                <div class="flex items-center justify-between gap-2">
-                    <div class="font-semibold text-cyan-300">筛选数据来源说明</div>
-                    <div class="flex items-center gap-2">
-                        <button onclick="toggleScreenerDataSourcePanel()" id="screener-data-source-toggle-btn" class="px-2 py-0.5 rounded border border-slate-600 bg-slate-800 text-slate-200 text-[10px]">展开</button>
-                        <button onclick="copyScreenerDataSourceDoc()" class="px-2 py-0.5 rounded border border-slate-600 bg-slate-800 text-slate-200 text-[10px]">复制说明</button>
-                        <div id="screener-data-source-updated" class="text-slate-500 font-mono">加载中...</div>
+            <!-- 数据来源 + AI 分析提示词说明卡：明确"数据来自哪里、落在哪、如何使用"，并展示 AI 分析按钮实际调用大模型的提示词，方便用户优先阅读与核验。 -->
+            <div id="screener-data-source-panel" class="px-4 py-2 border-b border-slate-600 bg-slate-950/80 text-[11px] text-slate-200 shrink-0" style="border-left: 4px solid #f59e0b;">
+                <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0 flex-1 font-bold text-amber-300 flex items-center">
+                        <i class="fa-solid fa-triangle-exclamation mr-1.5 text-amber-400 shrink-0"></i>
+                        <span class="break-words">筛选数据来源和AI分析提示词说明（请先阅读）</span>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <button onclick="toggleScreenerDataSourcePanel()" id="screener-data-source-toggle-btn" class="px-2 py-0.5 rounded border border-slate-600 bg-slate-800 text-slate-200 hover:bg-slate-700 text-[10px]">展开</button>
+                        <button onclick="copyScreenerDataSourceDoc()" class="px-2 py-0.5 rounded border border-slate-600 bg-slate-800 text-slate-200 hover:bg-slate-700 text-[10px]">复制说明</button>
+                        <div id="screener-data-source-updated" class="text-amber-300 font-mono">加载中...</div>
                     </div>
                 </div>
-                <div id="screener-data-source-content" class="mt-1 text-slate-400 leading-5 hidden">
+                <div id="screener-data-source-content" class="mt-1 text-slate-200 leading-5 hidden" style="max-height: 30vh; overflow-y: auto;">
                     正在加载数据来源、路径与使用逻辑...
                 </div>
-                <div id="screener-data-source-runtime" class="mt-1 text-slate-500 hidden">
+                <div id="screener-data-source-runtime" class="mt-1 text-slate-400 hidden">
                     本次筛选来源占比：尚未执行筛选
                 </div>
             </div>
@@ -8594,18 +8597,57 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
                 const doc = data.data || {};
                 screenerDataSourceDoc = doc;
                 updatedEl.textContent = doc.updated_at ? `更新时间 ${doc.updated_at}` : '已加载';
-                // 将数组文案渲染为简洁段落，保持在弹窗顶部可快速阅读。
                 const sec = (title, arr) => {
                     if (!Array.isArray(arr) || !arr.length) return '';
                     const lines = arr.map(x => `- ${String(x || '')}`).join('<br>');
-                    return `<div class="mt-1"><span class="text-cyan-300">${title}</span><br>${lines}</div>`;
+                    return `<div class="mt-1"><span class="text-amber-300">${title}</span><br>${lines}</div>`;
                 };
+                const aiSystemPrompt = '你是专业的股票分析师，输出格式为 JSON。';
+                const aiUserPrompt = `你是一个专业的股票分析师。请分析以下股票为什么被筛选选中，并给出深度分析和风险提示。
+
+【股票信息】
+股票：{code} {name}
+最新价：{price} 元
+涨跌幅：{change_pct}%
+成交额：{amount} 万元
+换手率：{turnover}%
+流通市值：{float_mv} 亿元
+总市值：{total_mv} 亿元
+
+【入选理由（基于筛选条件）】
+{conditions}
+
+请输出：
+1. 深度分析（300字以内）：分析这只股票的特点、为什么符合筛选条件、当前的市场位置和趋势
+2. 风险提示（3-5条）：这只股票可能存在的风险因素
+
+请用 JSON 格式输出，包含 analysis 和 risks 两个字段：
+{"analysis": "深度分析内容", "risks": ["风险1", "风险2", ...]}
+
+只输出 JSON，不要其他内容。`;
+                const promptBlock = `
+<div class="mt-3 pt-3 border-t border-amber-500/40">
+    <div class="text-amber-300 font-semibold mb-1">
+        <i class="fa-solid fa-robot mr-1"></i>AI 分析按钮实际调用大模型的提示词（原样展示，位置：结果列表"AI分析"列的"分析"按钮）
+    </div>
+    <div class="mt-1 text-slate-300">
+        <span class="text-amber-200">System 提示词：</span>
+        <pre class="mt-1 p-2 bg-slate-950/80 border border-amber-500/30 rounded text-[11px] text-slate-100 font-mono whitespace-pre-wrap break-words overflow-auto">${aiSystemPrompt}</pre>
+    </div>
+    <div class="mt-2 text-slate-300">
+        <span class="text-amber-200">User 提示词（占位符将在调用时替换为真实数据）：</span>
+        <pre class="mt-1 p-2 bg-slate-950/80 border border-amber-500/30 rounded text-[11px] text-slate-100 font-mono whitespace-pre-wrap break-words overflow-auto">${aiUserPrompt.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</pre>
+    </div>
+    <div class="mt-1 text-[10px] text-amber-200/80">
+        <i class="fa-solid fa-circle-info mr-0.5"></i>调用参数：temperature=0.3，max_tokens=2000；模型由"条件筛选模型"配置（screener_llm_*）决定。
+    </div>
+</div>`;
                 contentEl.innerHTML = [
                     sec('来源优先级', doc.source_priority),
                     sec('本地路径', doc.data_paths),
                     sec('使用逻辑', doc.usage_logic),
                     sec('当前限制', doc.limitations),
-                ].filter(Boolean).join('');
+                ].filter(Boolean).join('') + promptBlock;
             } catch (e) {
                 updatedEl.textContent = '加载失败';
                 contentEl.textContent = '数据来源说明加载失败，请检查 /api/screener/data_sources 接口。';
@@ -8631,7 +8673,7 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
         }
 
         async function copyScreenerDataSourceDoc() {
-            // 复制说明文本，方便合规/运营侧直接粘贴使用。
+            // 复制说明文本，方便合规/运营侧直接粘贴使用；同时附带 AI 分析按钮实际调用大模型的提示词，便于核验。
             const doc = screenerDataSourceDoc || {};
             const blocks = [];
             if (Array.isArray(doc.source_priority) && doc.source_priority.length) {
@@ -8646,10 +8688,34 @@ class GeneratedStrategyTemplate(BaseImplementedStrategy):
             if (Array.isArray(doc.limitations) && doc.limitations.length) {
                 blocks.push('当前限制\n' + doc.limitations.map(x => `- ${x}`).join('\n'));
             }
+            const aiSystemPrompt = '你是专业的股票分析师，输出格式为 JSON。';
+            const aiUserPrompt = `你是一个专业的股票分析师。请分析以下股票为什么被筛选选中，并给出深度分析和风险提示。
+
+【股票信息】
+股票：{code} {name}
+最新价：{price} 元
+涨跌幅：{change_pct}%
+成交额：{amount} 万元
+换手率：{turnover}%
+流通市值：{float_mv} 亿元
+总市值：{total_mv} 亿元
+
+【入选理由（基于筛选条件）】
+{conditions}
+
+请输出：
+1. 深度分析（300字以内）：分析这只股票的特点、为什么符合筛选条件、当前的市场位置和趋势
+2. 风险提示（3-5条）：这只股票可能存在的风险因素
+
+请用 JSON 格式输出，包含 analysis 和 risks 两个字段：
+{"analysis": "深度分析内容", "risks": ["风险1", "风险2", ...]}
+
+只输出 JSON，不要其他内容。`;
+            blocks.push(`AI 分析按钮提示词（位置：结果列表"AI分析"列"分析"按钮；调用参数：temperature=0.3, max_tokens=2000；模型由"条件筛选模型"screener_llm_* 配置决定）\n\n[System 提示词]\n${aiSystemPrompt}\n\n[User 提示词]\n（占位符 {code}/{name}/{price}/{change_pct}/{amount}/{turnover}/{float_mv}/{total_mv}/{conditions} 在调用时替换为真实数据）\n${aiUserPrompt}`);
             const text = blocks.join('\n\n') || '暂无可复制说明';
             try {
                 await navigator.clipboard.writeText(text);
-                showScreenerToast('说明已复制到剪贴板', 'success');
+                showScreenerToast('说明与AI提示词已复制到剪贴板', 'success');
             } catch (e) {
                 showScreenerToast('复制失败，请手动复制', 'warning');
             }

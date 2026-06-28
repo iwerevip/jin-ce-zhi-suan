@@ -18,6 +18,7 @@
       "data_provider.mysql_password",
       "data_provider.postgres_password",
       "data_provider.default_api_url",
+      "data_provider.screener_llm_api_key",
       "webhook_notification.feishu_webhook_url",
       "webhook_notification.feishu_secret",
       "evolution.llm.api_key"
@@ -102,7 +103,7 @@
     "screener_llm_api_url": "https://api.deepseek.com",
     "screener_llm_model": "deepseek-v4-flash",
     "screener_llm_timeout_sec": 60,
-    "screener_llm_api_key": "sk-2bb442e98cec4ba2b609f30341d12ef0"
+    "screener_llm_api_key": ""
   },
   "history_sync": {
     "scheduler_enabled": false,

@@ -107,6 +107,7 @@ hiddenimports = [
     "fastapi", "fastapi.middleware", "fastapi.middleware.cors", "fastapi.staticfiles",
     "fastapi.responses", "fastapi.exceptions",
     "starlette.exceptions",
+    "sse_starlette", "sse_starlette.sse",
     "pydantic",
     "pandas", "numpy", "matplotlib", "mplfinance",
     "tushare", "akshare", "pymysql", "psycopg2", "duckdb",
